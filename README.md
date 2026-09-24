@@ -16,7 +16,7 @@ Local account records live in `.orbit-data/accounts.json`; hosted accounts use U
 
 ## Deploy to Vercel
 
-The project includes a Vercel function adapter in `api/[...path].js`; `public/` is served as the static frontend. The local `node server.js` path remains available for development.
+The project includes a Vercel function adapter in `api/[...path].js`; `public/` is served as the static frontend. Vercel installs the exact `package-lock.json` dependency tree with `npm ci --legacy-peer-deps`, which avoids re-resolving the WDK packages' optional peer dependencies during deployment. The local `node server.js` path remains available for development.
 
 1. Create an Upstash Redis database and copy its REST URL and token.
 2. Import this repository into Vercel with the project root set to this directory. The build command is `npm run build`; the output directory is `public`.
