@@ -16,9 +16,20 @@ async function api(path, data) {
   let response
   try { response = await fetch(`/api/${path}`, { method: data ? 'POST' : 'GET', headers, body: data ? JSON.stringify(data) : undefined }) }
   catch { throw new Error('Could not reach the wallet service. Check your connection and try again.') }
+  const responseText = await response.text()
   let result
-  try { result = await response.json() }
-  catch { throw new Error('The wallet service returned an unexpected response. Please try again.') }
+  try { result = responseText ? JSON.parse(responseText) : {} }
+  catch {
+    // Vercel can return a plain-text/HTML function error (timeout, missing
+    // deployment, or runtime failure) before our API handler can emit JSON.
+    // Surface the useful status and Vercel request ID instead of hiding it.
+    const code = responseText.match(/FUNCTION_[A-Z_]+|DEPLOYMENT_NOT_FOUND|INTERNAL_SERVER_ERROR|NOT_FOUND/)?.[0]
+    const requestId = response.headers.get('x-vercel-id')
+    const status = `HTTP ${response.status}`
+    const detail = code ? ` (${code})` : ''
+    const request = requestId ? ` Vercel request: ${requestId}.` : ''
+    throw new Error(`The wallet API returned an invalid response: ${status}${detail}.${request} Check the Vercel Function Logs for this request.`)
+  }
   if (!response.ok) throw new Error(result.error || 'Something went wrong')
   return result
 }
