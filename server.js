@@ -210,11 +210,13 @@ function explainWalletError(error) {
   return error?.message || 'Something went wrong. Please try again.'
 }
 
-function indexerApiKey() {
+function indexerApiCredentials() {
   const testNetworks = chains.some(chain => /test|devnet|shasta|amoy/i.test(chain.network))
-  return testNetworks
-    ? process.env.TEST_KEY || process.env.TES_KEY || process.env.WDK_INDEXER_API_KEY
-    : process.env.PRODUCTION_KEY || process.env.WDK_INDEXER_API_KEY
+  const candidates = testNetworks
+    ? [['TEST_KEY', process.env.TEST_KEY], ['TES_KEY', process.env.TES_KEY], ['WDK_INDEXER_API_KEY', process.env.WDK_INDEXER_API_KEY]]
+    : [['PRODUCTION_KEY', process.env.PRODUCTION_KEY], ['WDK_INDEXER_API_KEY', process.env.WDK_INDEXER_API_KEY]]
+  const selected = candidates.find(([, value]) => value)
+  return { name: selected?.[0] || candidates[0][0], value: selected?.[1], networkType: testNetworks ? 'testnet' : 'mainnet' }
 }
 
 async function fetchIndexerJson(path, apiKey) {
@@ -272,8 +274,12 @@ function normalizeIndexedTransfer(transfer, chain, token, address) {
 }
 
 async function getIndexedActivity(session) {
-  const apiKey = indexerApiKey()
-  if (!apiKey) return { activity: [], note: 'Historical indexing is not configured on this server.' }
+  const credentials = indexerApiCredentials()
+  const apiKey = credentials.value
+  if (!apiKey) {
+    console.warn(`[indexer] Missing ${credentials.name} for ${credentials.networkType}; no key value was logged`)
+    return { activity: [], note: `Historical indexing is not configured for these ${credentials.networkType} networks. Add ${credentials.name} to the Vercel environment and redeploy.` }
+  }
   if (session.indexedActivity && session.indexedAt > Date.now() - 60_000) {
     return { activity: session.indexedActivity, note: session.indexedNote }
   }
@@ -297,11 +303,14 @@ async function getIndexedActivity(session) {
     const note = queried.length
       ? `Tether Indexer history: ${queried.join(', ')}. Native coin history and networks the indexer does not list are not included.`
       : 'Tether Indexer is connected, but it does not currently index these wallet networks.'
+    console.info(`[indexer] ${credentials.name} accepted; queried ${queried.length} supported network/token pair(s), received ${indexed.length} transfer(s)`)
     session.indexedActivity = indexed
     session.indexedAt = Date.now()
     session.indexedNote = note
     return { activity: indexed, note }
   } catch (error) {
+    const failure = error.status ? `HTTP ${error.status}` : (error.name || 'network error')
+    console.error(`[indexer] ${credentials.name} request failed: ${failure}; key value omitted`)
     const note = error.status === 401
       ? 'Tether Indexer rejected the configured key. Check TEST_KEY or PRODUCTION_KEY in .env.'
       : error.status === 429
