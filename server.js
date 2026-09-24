@@ -1,5 +1,5 @@
 import { createServer } from 'node:http'
-import { randomBytes, scryptSync, timingSafeEqual, createCipheriv, createDecipheriv } from 'node:crypto'
+import { createHash, randomBytes, scryptSync, timingSafeEqual, createCipheriv, createDecipheriv } from 'node:crypto'
 import { mkdir, readFile, rename, chmod, stat, writeFile } from 'node:fs/promises'
 import { extname, join, normalize } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -18,6 +18,7 @@ const dataDir = join(root, '.orbit-data')
 const usersFile = join(dataDir, 'accounts.json')
 const sessions = new Map()
 const loginFailures = new Map()
+const trustedDeviceLifetimeSeconds = 30 * 24 * 60 * 60
 let users = {}
 let indexerCatalogCache = { expiresAt: 0, chains: null }
 const indexerBaseUrl = 'https://wdk-api.tether.io'
@@ -31,9 +32,53 @@ const chains = [
   { id: 'tron', name: 'TRON', symbol: 'TRX', kind: 'tron', rpc: process.env.TRON_RPC_URL, defaultRpc: 'https://api.shasta.trongrid.io', network: 'Shasta' }
 ]
 
-function json(res, status, data) {
-  res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' })
+function json(res, status, data, headers = {}) {
+  res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...headers })
   res.end(JSON.stringify(data))
+}
+
+function readTrustedDevice(req) {
+  const cookie = req.headers.cookie?.split(';').map(part => part.trim()).find(part => part.startsWith('orbit-trusted-device='))
+  const value = cookie?.slice('orbit-trusted-device='.length)
+  return value && /^[A-Za-z0-9_-]{40,60}$/.test(value) ? value : null
+}
+
+function hashTrustedDevice(value) {
+  return createHash('sha256').update(value).digest('hex')
+}
+
+function trustedDeviceCookie(value) {
+  return `orbit-trusted-device=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${trustedDeviceLifetimeSeconds}${hosted ? '; Secure' : ''}`
+}
+
+async function isTrustedDevice(username, deviceHash) {
+  const key = username.toLowerCase()
+  if (hosted) return Number(await redisCommand('SISMEMBER', `orbit:trusted-devices:${key}`, deviceHash)) === 1
+  return Array.isArray(users[key]?.trustedDevices) && users[key].trustedDevices.includes(deviceHash)
+}
+
+async function rememberTrustedDevice(username, deviceHash) {
+  const key = username.toLowerCase()
+  if (hosted) {
+    await redisCommand('SADD', `orbit:trusted-devices:${key}`, deviceHash)
+    await redisCommand('EXPIRE', `orbit:trusted-devices:${key}`, String(trustedDeviceLifetimeSeconds))
+    return
+  }
+  const record = users[key]
+  if (!record) throw new Error('Wallet account could not be found')
+  record.trustedDevices = [...new Set([...(record.trustedDevices || []), deviceHash])].slice(-12)
+  await persistUsers()
+}
+
+function normalizeRecoveryPhrase(value) {
+  if (typeof value !== 'string') return null
+  const phrase = value.trim().toLowerCase().replace(/\s+/g, ' ')
+  if (![12, 24].includes(phrase.split(' ').length)) return null
+  try { Wallet.fromPhrase(phrase); return phrase } catch { return null }
+}
+
+function recoveryPhrasesMatch(first, second) {
+  return timingSafeEqual(createHash('sha256').update(first).digest(), createHash('sha256').update(second).digest())
 }
 
 async function body(req) {
@@ -389,9 +434,11 @@ export async function handleRequest(req, res) {
         const phrase = Wallet.createRandom().mnemonic.phrase
         const record = { username, ...encryptSeed(phrase, input.password), createdAt: new Date().toISOString() }
         if (!await createUser(key, record)) return json(res, 409, { error: 'That username is already registered' })
+        const deviceToken = randomBytes(32).toString('base64url')
+        await rememberTrustedDevice(username, hashTrustedDevice(deviceToken))
         const opened = await openSession(username, phrase)
         activeSession = opened.session
-        return json(res, 201, { ...opened.wallet, token: opened.token, recoveryPhrase: phrase })
+        return json(res, 201, { ...opened.wallet, token: opened.token, recoveryPhrase: phrase }, { 'set-cookie': trustedDeviceCookie(deviceToken) })
       }
       if (req.method === 'POST' && url.pathname === '/api/restore') {
         const input = await body(req)
@@ -403,9 +450,11 @@ export async function handleRequest(req, res) {
         catch { return json(res, 400, { error: 'That recovery phrase is not valid' }) }
         const key = username.toLowerCase()
         if (!await createUser(key, { username, ...encryptSeed(phrase, input.password), createdAt: new Date().toISOString() })) return json(res, 409, { error: 'That username is already registered' })
+        const deviceToken = randomBytes(32).toString('base64url')
+        await rememberTrustedDevice(username, hashTrustedDevice(deviceToken))
         const opened = await openSession(username, phrase)
         activeSession = opened.session
-        return json(res, 201, { ...opened.wallet, token: opened.token })
+        return json(res, 201, { ...opened.wallet, token: opened.token }, { 'set-cookie': trustedDeviceCookie(deviceToken) })
       }
       if (req.method === 'POST' && url.pathname === '/api/login') {
         const input = await body(req)
@@ -419,6 +468,22 @@ export async function handleRequest(req, res) {
         if (!seedPhrase) {
           await recordLoginFailure(key)
           return json(res, 401, { error: 'Username or password is incorrect' })
+        }
+        const currentDevice = readTrustedDevice(req)
+        const deviceHash = currentDevice && hashTrustedDevice(currentDevice)
+        if (!deviceHash || !await isTrustedDevice(record.username, deviceHash)) {
+          const recoveryPhrase = normalizeRecoveryPhrase(input.recoveryPhrase)
+          if (!recoveryPhrase) return json(res, 428, { code: 'NEW_DEVICE_VERIFICATION_REQUIRED', error: 'This browser needs a one-time recovery phrase check. Enter your 12 or 24 words to continue.' })
+          if (!recoveryPhrasesMatch(recoveryPhrase, seedPhrase)) {
+            await recordLoginFailure(key)
+            return json(res, 401, { error: 'That recovery phrase does not match this wallet.' })
+          }
+          const deviceToken = randomBytes(32).toString('base64url')
+          await rememberTrustedDevice(record.username, hashTrustedDevice(deviceToken))
+          await clearLoginFailures(key)
+          const opened = await openSession(record.username, seedPhrase)
+          activeSession = opened.session
+          return json(res, 200, { ...opened.wallet, token: opened.token }, { 'set-cookie': trustedDeviceCookie(deviceToken) })
         }
         await clearLoginFailures(key)
         const opened = await openSession(record.username, seedPhrase)

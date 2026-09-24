@@ -30,7 +30,12 @@ async function api(path, data) {
     const request = requestId ? ` Vercel request: ${requestId}.` : ''
     throw new Error(`The wallet API returned an invalid response: ${status}${detail}.${request} Check the Vercel Function Logs for this request.`)
   }
-  if (!response.ok) throw new Error(result.error || 'Something went wrong')
+  if (!response.ok) {
+    const error = new Error(result.error || 'Something went wrong')
+    error.status = response.status
+    error.code = result.code
+    throw error
+  }
   return result
 }
 function toast(message) {
@@ -222,11 +227,26 @@ $('#register-submit').addEventListener('click', async event => {
 ;['register-username', 'register-password', 'register-password-confirm'].forEach(id => $(`#${id}`).addEventListener('input', () => setFormError('register-error', '')))
 $('#login-form').addEventListener('submit', async event => {
   event.preventDefault(); setFormError('login-error', ''); const button = $('#login-submit'); button.disabled = true; button.textContent = 'Unlocking wallet…'
-  try { const password = $('#login-password').value; const wallet = await api('login', { username: $('#login-username').value.trim(), password }); $('#login-dialog').close(); $('#login-password').value = ''; setWallet(wallet, password) }
-  catch (error) { setFormError('login-error', error.message) }
+  try {
+    const password = $('#login-password').value
+    const recoveryPhrase = $('#login-recovery-phrase').value.trim()
+    const wallet = await api('login', { username: $('#login-username').value.trim(), password, ...(recoveryPhrase ? { recoveryPhrase } : {}) })
+    $('#login-dialog').close(); $('#login-recovery-phrase').value = ''; $('#login-device-check').classList.add('hidden'); $('#login-password').value = ''; setWallet(wallet, password)
+  }
+  catch (error) {
+    if (error.code === 'NEW_DEVICE_VERIFICATION_REQUIRED') {
+      $('#login-device-check').classList.remove('hidden')
+      $('#login-recovery-phrase').focus()
+      setFormError('login-error', error.message)
+    } else setFormError('login-error', error.message)
+  }
   finally { button.disabled = false; button.innerHTML = 'Log in securely <span>↗</span>' }
 })
-;['login-username', 'login-password'].forEach(id => $(`#${id}`).addEventListener('input', () => setFormError('login-error', '')))
+;['login-username', 'login-password'].forEach(id => $(`#${id}`).addEventListener('input', () => {
+  setFormError('login-error', '')
+  if (id === 'login-username') { $('#login-device-check').classList.add('hidden'); $('#login-recovery-phrase').value = '' }
+}))
+$('#login-recovery-phrase').addEventListener('input', () => setFormError('login-error', ''))
 $('#restore-submit').addEventListener('click', async event => {
   event.preventDefault(); setFormError('restore-error', '')
   const phrase = restoreWords.slice(0, restoreWordCount).map(word => word.trim()).join(' ')
@@ -435,7 +455,7 @@ $$('dialog').forEach(dialog => {
   if (dialog.id === 'phrase-dialog') dialog.addEventListener('cancel', event => event.preventDefault())
   if (dialog.id === 'security-dialog') dialog.addEventListener('close', () => { $('#recovery-words').replaceChildren(); $('#recovery-reveal').classList.add('hidden'); $('#reveal-password').value = '' })
   if (dialog.id === 'register-dialog') dialog.addEventListener('close', () => { $('#register-password').value = ''; $('#register-password-confirm').value = '' })
-  if (dialog.id === 'login-dialog') dialog.addEventListener('close', () => { $('#login-password').value = '' })
+  if (dialog.id === 'login-dialog') dialog.addEventListener('close', () => { $('#login-password').value = ''; $('#login-recovery-phrase').value = ''; $('#login-device-check').classList.add('hidden'); setFormError('login-error', '') })
   if (dialog.id === 'restore-dialog') dialog.addEventListener('close', () => { restoreWords = Array(24).fill(''); $('#restore-password').value = ''; setFormError('restore-error', '') })
 })
 $$('dialog form').forEach(form => form.addEventListener('submit', event => {
