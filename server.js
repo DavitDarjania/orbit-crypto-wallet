@@ -13,6 +13,7 @@ import { Wallet } from 'ethers'
 const root = fileURLToPath(new URL('.', import.meta.url))
 try { process.loadEnvFile(join(root, '.env')) } catch (error) { if (error.code !== 'ENOENT') throw error }
 const port = Number(process.env.PORT || 4173)
+const hosted = process.env.VERCEL === '1'
 const dataDir = join(root, '.orbit-data')
 const usersFile = join(dataDir, 'accounts.json')
 const sessions = new Map()
@@ -36,6 +37,16 @@ function json(res, status, data) {
 }
 
 async function body(req) {
+  if (req.body != null) {
+    if (typeof req.body === 'object') {
+      if (Buffer.byteLength(JSON.stringify(req.body)) > 16_000) throw Object.assign(new Error('Request is too large'), { statusCode: 413 })
+      return req.body
+    }
+    if (typeof req.body === 'string') {
+      if (Buffer.byteLength(req.body) > 16_000) throw Object.assign(new Error('Request is too large'), { statusCode: 413 })
+      return req.body ? JSON.parse(req.body) : {}
+    }
+  }
   let raw = ''
   for await (const chunk of req) {
     raw += chunk
@@ -88,6 +99,71 @@ async function persistUsers() {
   await chmod(tempFile, 0o600)
   await rename(tempFile, usersFile)
   await chmod(usersFile, 0o600)
+}
+
+function redisConfigured() {
+  return Boolean(process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN)
+}
+
+async function redisCommand(...command) {
+  if (!redisConfigured()) throw Object.assign(new Error('Hosted wallet storage is not configured. Add UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN to the Vercel project environment.'), { statusCode: 503, publicMessage: 'Hosted wallet storage is not configured. Set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN in Vercel Project Settings.' })
+  const response = await fetch(process.env.UPSTASH_REDIS_REST_URL, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${process.env.UPSTASH_REDIS_REST_TOKEN}`, 'content-type': 'application/json' },
+    body: JSON.stringify(command),
+    signal: AbortSignal.timeout(5000)
+  })
+  const result = await response.json().catch(() => ({}))
+  if (!response.ok || result.error) throw Object.assign(new Error('Hosted wallet storage is temporarily unavailable.'), { statusCode: 503, publicMessage: 'Wallet storage is temporarily unavailable. Try again shortly.' })
+  return result.result
+}
+
+async function getUser(key) {
+  if (!hosted) return users[key]
+  const value = await redisCommand('GET', `orbit:user:${key}`)
+  return value ? JSON.parse(value) : undefined
+}
+
+async function createUser(key, record) {
+  if (hosted) return (await redisCommand('SET', `orbit:user:${key}`, JSON.stringify(record), 'NX')) === 'OK'
+  if (hasUser(key)) return false
+  users[key] = record
+  await persistUsers()
+  return true
+}
+
+async function loginFailureCount(key) {
+  if (!hosted) {
+    const failure = loginFailures.get(key)
+    if (failure?.until > Date.now()) return { blocked: true, count: 0 }
+    return { blocked: false, count: failure?.count || 0 }
+  }
+  return { blocked: Number(await redisCommand('TTL', `orbit:login-lock:${key}`)) > 0, count: Number(await redisCommand('GET', `orbit:login-fails:${key}`) || 0) }
+}
+
+async function recordLoginFailure(key) {
+  if (hosted) {
+    const count = Number(await redisCommand('INCR', `orbit:login-fails:${key}`))
+    if (count === 1) await redisCommand('EXPIRE', `orbit:login-fails:${key}`, '300')
+    if (count >= 5) {
+      await redisCommand('SET', `orbit:login-lock:${key}`, '1', 'EX', '300')
+      await redisCommand('DEL', `orbit:login-fails:${key}`)
+    }
+    return
+  }
+  const current = loginFailures.get(key)?.until > Date.now() ? loginFailures.get(key) : { count: 0, until: 0 }
+  current.count += 1
+  if (current.count >= 5) { current.count = 0; current.until = Date.now() + 5 * 60 * 1000 }
+  loginFailures.set(key, current)
+}
+
+async function clearLoginFailures(key) {
+  if (hosted) await redisCommand('DEL', `orbit:login-fails:${key}`, `orbit:login-lock:${key}`)
+  else loginFailures.delete(key)
+}
+
+async function saveHostedSession(session) {
+  await redisCommand('SET', `orbit:session:${session.token}`, JSON.stringify({ username: session.username, activity: session.activity }), 'EX', '43200')
 }
 
 function sessionPayload(session) {
@@ -235,8 +311,7 @@ async function getIndexedActivity(session) {
   }
 }
 
-async function openSession(username, seedPhrase) {
-  const token = randomBytes(32).toString('base64url')
+async function openSession(username, seedPhrase, token = randomBytes(32).toString('base64url'), { persistHosted = true } = {}) {
   const wdk = new WDK(seedPhrase)
   const accountMap = new Map()
   const addresses = {}
@@ -257,7 +332,9 @@ async function openSession(username, seedPhrase) {
     }
     if (!Object.keys(addresses).length) throw new Error('No wallet networks could be initialized')
     const session = { token, username, wdk, accounts: accountMap, addresses, activity: [], indexedActivity: null, indexedAt: 0, indexedNote: '' }
-    sessions.set(token, session)
+    if (hosted) {
+      if (persistHosted) await saveHostedSession(session)
+    } else sessions.set(token, session)
     return { token, session, wallet: sessionPayload(session) }
   } catch (error) {
     wdk.dispose()
@@ -265,9 +342,21 @@ async function openSession(username, seedPhrase) {
   }
 }
 
-function getSession(req) {
+async function getSession(req) {
   const token = req.headers.authorization?.match(/^Bearer ([\w-]+)$/)?.[1]
-  return token ? sessions.get(token) : undefined
+  if (!token) return undefined
+  if (!hosted) return sessions.get(token)
+  const saved = await redisCommand('GET', `orbit:session:${token}`)
+  if (!saved) return undefined
+  let data
+  try { data = JSON.parse(saved) } catch { return undefined }
+  const record = await getUser(String(data.username || '').toLowerCase())
+  const password = req.headers['x-wallet-password']
+  const phrase = record && typeof password === 'string' && password.length >= 10 && password.length <= 256 ? decryptSeed(record, password) : null
+  if (!phrase) return undefined
+  const opened = await openSession(record.username, phrase, token, { persistHosted: false })
+  opened.session.activity = Array.isArray(data.activity) ? data.activity : []
+  return opened.session
 }
 
 async function initializeStorage() {
@@ -277,22 +366,22 @@ async function initializeStorage() {
   catch (error) { if (error.code !== 'ENOENT') throw error }
 }
 
-const server = createServer(async (req, res) => {
+export async function handleRequest(req, res) {
+  let activeSession
   try {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
-    if (req.method === 'OPTIONS') { res.writeHead(204, { 'access-control-allow-methods': 'GET,POST,OPTIONS', 'access-control-allow-headers': 'content-type,authorization' }); return res.end() }
+    if (req.method === 'OPTIONS') { res.writeHead(204, { 'access-control-allow-methods': 'GET,POST,OPTIONS', 'access-control-allow-headers': 'content-type,authorization,x-wallet-password' }); return res.end() }
     if (url.pathname.startsWith('/api/')) {
       if (req.method === 'POST' && url.pathname === '/api/register') {
         const input = await body(req)
         const username = normalizeUsername(input.username)
         if (typeof input.password !== 'string' || input.password.length < 10 || input.password.length > 256) return json(res, 400, { error: 'Choose a password with at least 10 characters' })
         const key = username.toLowerCase()
-        if (hasUser(key)) return json(res, 409, { error: 'That username is already registered on this device' })
         const phrase = Wallet.createRandom().mnemonic.phrase
         const record = { username, ...encryptSeed(phrase, input.password), createdAt: new Date().toISOString() }
-        users[key] = record
-        await persistUsers()
+        if (!await createUser(key, record)) return json(res, 409, { error: 'That username is already registered' })
         const opened = await openSession(username, phrase)
+        activeSession = opened.session
         return json(res, 201, { ...opened.wallet, token: opened.token, recoveryPhrase: phrase })
       }
       if (req.method === 'POST' && url.pathname === '/api/restore') {
@@ -304,10 +393,9 @@ const server = createServer(async (req, res) => {
         try { Wallet.fromPhrase(input.phrase.trim()); phrase = input.phrase.trim().toLowerCase().replace(/\s+/g, ' ') }
         catch { return json(res, 400, { error: 'That recovery phrase is not valid' }) }
         const key = username.toLowerCase()
-        if (hasUser(key)) return json(res, 409, { error: 'That username is already registered on this device' })
-        users[key] = { username, ...encryptSeed(phrase, input.password), createdAt: new Date().toISOString() }
-        await persistUsers()
+        if (!await createUser(key, { username, ...encryptSeed(phrase, input.password), createdAt: new Date().toISOString() })) return json(res, 409, { error: 'That username is already registered' })
         const opened = await openSession(username, phrase)
+        activeSession = opened.session
         return json(res, 201, { ...opened.wallet, token: opened.token })
       }
       if (req.method === 'POST' && url.pathname === '/api/login') {
@@ -315,30 +403,33 @@ const server = createServer(async (req, res) => {
         let username
         try { username = normalizeUsername(input.username) } catch { return json(res, 401, { error: 'Username or password is incorrect' }) }
         const key = username.toLowerCase()
-        const failures = loginFailures.get(key)
-        if (failures?.until > Date.now()) return json(res, 429, { error: 'Too many attempts. Try again in a few minutes.' })
-        const record = hasUser(key) ? users[key] : undefined
+        const failures = await loginFailureCount(key)
+        if (failures.blocked) return json(res, 429, { error: 'Too many attempts. Try again in a few minutes.' })
+        const record = await getUser(key)
         const seedPhrase = record && typeof input.password === 'string' ? decryptSeed(record, input.password) : null
         if (!seedPhrase) {
-          const current = failures?.until > Date.now() ? failures : { count: 0, until: 0 }
-          current.count += 1
-          if (current.count >= 5) { current.count = 0; current.until = Date.now() + 5 * 60 * 1000 }
-          loginFailures.set(key, current)
+          await recordLoginFailure(key)
           return json(res, 401, { error: 'Username or password is incorrect' })
         }
-        loginFailures.delete(key)
+        await clearLoginFailures(key)
         const opened = await openSession(record.username, seedPhrase)
+        activeSession = opened.session
         return json(res, 200, { ...opened.wallet, token: opened.token })
       }
       if (req.method === 'GET' && url.pathname === '/api/state') {
-        const session = getSession(req)
+        const session = activeSession = await getSession(req)
         return json(res, 200, session ? sessionPayload(session) : { authenticated: false })
       }
-      const session = getSession(req)
+      if (req.method === 'POST' && url.pathname === '/api/lock' && hosted) {
+        const token = req.headers.authorization?.match(/^Bearer ([\w-]+)$/)?.[1]
+        if (token) await redisCommand('DEL', `orbit:session:${token}`)
+        return json(res, 200, { locked: true })
+      }
+      const session = activeSession = await getSession(req)
       if (!session) return json(res, 401, { error: 'Please log in again' })
       if (req.method === 'POST' && url.pathname === '/api/reveal-recovery') {
         const input = await body(req)
-        const record = users[session.username.toLowerCase()]
+        const record = await getUser(session.username.toLowerCase())
         const phrase = record && typeof input.password === 'string' ? decryptSeed(record, input.password) : null
         if (!phrase) return json(res, 401, { error: 'Password is incorrect' })
         return json(res, 200, { phrase })
@@ -437,6 +528,10 @@ const server = createServer(async (req, res) => {
         const result = await account.sendTransaction({ to: to.trim(), value })
         const entry = { chain: id, to: to.trim(), amount: String(amount), hash: result.hash, fee: String(result.fee ?? ''), createdAt: new Date().toISOString(), kind: 'send' }
         session.activity.unshift(entry)
+        if (hosted) {
+          try { await saveHostedSession(session) }
+          catch (error) { console.error(`Transaction ${entry.hash} was sent, but session history could not be saved: ${error.message}`) }
+        }
         return json(res, 200, entry)
       }
       return json(res, 404, { error: 'Unknown API route' })
@@ -450,9 +545,14 @@ const server = createServer(async (req, res) => {
   } catch (error) {
     const status = error.statusCode || 400
     if (status >= 500) console.error(error)
-    json(res, status, { error: status >= 500 ? 'The wallet could not complete that request. Please try again.' : explainWalletError(error) })
+    json(res, status, { error: error.publicMessage || (status >= 500 ? 'The wallet could not complete that request. Please try again.' : explainWalletError(error)) })
+  } finally {
+    if (hosted && activeSession?.wdk) activeSession.wdk.dispose()
   }
-})
+}
 
-await initializeStorage()
-server.listen(port, '127.0.0.1', () => console.log(`Wallet app ready at http://localhost:${port}`))
+if (!hosted) {
+  await initializeStorage()
+  const server = createServer(handleRequest)
+  server.listen(port, '127.0.0.1', () => console.log(`Wallet app ready at http://localhost:${port}`))
+}

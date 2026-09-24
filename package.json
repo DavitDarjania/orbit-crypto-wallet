@@ -1,8 +1,12 @@
 {
   "name": "crypto-wallet-app",
   "version": "1.0.0",
+  "engines": {
+    "node": "22.x"
+  },
   "main": "server.js",
   "scripts": {
+    "build": "node --check server.js && node --check 'api/[...path].js'",
     "start": "node server.js",
     "dev": "node --watch server.js"
   },

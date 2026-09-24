@@ -12,7 +12,19 @@ npm start
 
 Open http://localhost:4173. The server binds to `127.0.0.1`. Local account records live in `.orbit-data/accounts.json`, which is excluded from Git. Passwords are not stored; a scrypt-derived key encrypts each recovery phrase with AES-256-GCM. Sessions and transaction activity stay in process memory and are cleared when you lock the wallet or stop the server. Save the recovery phrase offline. Anyone who has it can control the wallet. You can reveal it again under Security & Recovery after confirming your password.
 
-This account system is intended for one user's local device. It is not a hosted, multi-user authentication service and should not be exposed to the internet as-is. Back up `.orbit-data` and recovery phrases securely.
+Local account records live in `.orbit-data/accounts.json`; hosted accounts use Upstash Redis. Back up the local data and recovery phrases securely. On Vercel, the encrypted recovery phrase stays encrypted in Redis. While a wallet is unlocked, the browser keeps the password in memory and sends it to the API over HTTPS so each function invocation can decrypt the phrase and recreate its WDK accounts. The password is not saved in browser storage or Redis. Lock the wallet before closing a shared device.
+
+## Deploy to Vercel
+
+The project includes a Vercel function adapter in `api/[...path].js`; `public/` is served as the static frontend. The local `node server.js` path remains available for development.
+
+1. Create an Upstash Redis database and copy its REST URL and token.
+2. Import this repository into Vercel with the project root set to this directory. The build command is `npm run build`; the output directory is `public`.
+3. Add `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN` in Vercel Project Settings → Environment Variables for each environment you will deploy.
+4. Add any private RPC and WDK indexer keys there as needed. Do not commit `.env` or paste credentials into source code.
+5. Redeploy after setting the variables. Registration and login return a configuration error until hosted Redis is connected.
+
+User records contain only password-encrypted seed phrases. Hosted session records contain the username and recent session activity, not the recovery phrase. The function receives the password over HTTPS for each authenticated request and disposes its WDK instance after the request. Vercel/Upstash access is therefore part of the wallet trust boundary; this hosted prototype still needs an independent security review before holding real funds.
 
 ## Networks
 
@@ -22,7 +34,7 @@ The frontend identifies configured RPCs and test networks. The server uses `TEST
 
 ## Current boundaries
 
-- Username/password registration, login, and recovery are local to this device. There is no hosted account service, email verification, password-reset service, or production-grade multi-user backend.
+- Username/password registration, login, and recovery use local files in development and Upstash Redis when deployed to Vercel. There is no email verification or password-reset service.
 - Send currently supports native assets on the registered networks. Token transfers require token selection and token-specific contract/decimal validation before they should be exposed.
 - Activity is held in memory for the unlocked session; older history needs an indexing provider.
 - Public testnet RPCs may be rate limited or unavailable. Production networks are not enabled by default.

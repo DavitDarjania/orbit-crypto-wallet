@@ -1,6 +1,6 @@
 const $ = (selector, parent = document) => parent.querySelector(selector)
 const $$ = (selector, parent = document) => [...parent.querySelectorAll(selector)]
-const state = { chains: [], addresses: {}, balances: {}, activeChain: 'ethereum', hidden: false, view: 'overview', token: sessionStorage.getItem('orbit-session'), username: '', pendingWallet: null }
+const state = { chains: [], addresses: {}, balances: {}, activeChain: 'ethereum', hidden: false, view: 'overview', token: sessionStorage.getItem('orbit-session'), password: '', username: '', pendingWallet: null }
 const titles = { ethereum: 'Ethereum', polygon: 'Polygon', arbitrum: 'Arbitrum', solana: 'Solana', bitcoin: 'Bitcoin', tron: 'TRON' }
 const symbols = { ethereum: 'ETH', polygon: 'POL', arbitrum: 'ETH', solana: 'SOL', bitcoin: 'BTC', tron: 'TRX' }
 const icons = { ethereum: 'Ξ', polygon: '⬡', arbitrum: '◉', solana: '◎', bitcoin: '₿', tron: '◉' }
@@ -12,6 +12,7 @@ let activityFilter = 'all'
 async function api(path, data) {
   const headers = data ? { 'content-type': 'application/json' } : {}
   if (state.token) headers.authorization = `Bearer ${state.token}`
+  if (state.token && state.password) headers['x-wallet-password'] = state.password
   let response
   try { response = await fetch(`/api/${path}`, { method: data ? 'POST' : 'GET', headers, body: data ? JSON.stringify(data) : undefined }) }
   catch { throw new Error('Could not reach the wallet service. Check your connection and try again.') }
@@ -40,8 +41,9 @@ function money(value) {
   if (value == null || !Number.isFinite(value)) return '—'
   return value.toLocaleString('en-US', { maximumFractionDigits: value > 100 ? 2 : 5 })
 }
-function setWallet(wallet) {
+function setWallet(wallet, password = state.password) {
   if (wallet.token) { state.token = wallet.token; sessionStorage.setItem('orbit-session', wallet.token) }
+  if (password) state.password = password
   state.username = wallet.username || state.username
   state.chains = wallet.chains || []
   state.addresses = Object.fromEntries(state.chains.filter(c => c.address).map(c => [c.id, c.address]))
@@ -151,7 +153,7 @@ function openPhrase(phrase) {
   $('#phrase-dialog').showModal()
 }
 $('#phrase-check').addEventListener('change', event => { $('#phrase-continue').disabled = !event.target.checked })
-$('#phrase-continue').addEventListener('click', event => { event.preventDefault(); $('#phrase-dialog').close(); setWallet(state.pendingWallet); state.pendingWallet = null })
+$('#phrase-continue').addEventListener('click', event => { event.preventDefault(); $('#phrase-dialog').close(); setWallet(state.pendingWallet, state.password); state.pendingWallet = null })
 $('#register-account').addEventListener('click', () => $('#register-dialog').showModal())
 $('#login-account').addEventListener('click', () => $('#login-dialog').showModal())
 let restoreWordCount = 12
@@ -202,14 +204,14 @@ $('#register-submit').addEventListener('click', async event => {
   setFormError('register-error', '')
   if (password !== confirmation) return setFormError('register-error', 'Those passwords do not match.')
   const button = $('#register-submit'); button.disabled = true; button.textContent = 'Creating account…'
-  try { const wallet = await api('register', { username, password }); $('#register-dialog').close(); $('#register-password').value = ''; $('#register-password-confirm').value = ''; state.pendingWallet = wallet; state.token = wallet.token; state.username = wallet.username; sessionStorage.setItem('orbit-session', wallet.token); openPhrase(wallet.recoveryPhrase) }
+  try { const wallet = await api('register', { username, password }); $('#register-dialog').close(); $('#register-password').value = ''; $('#register-password-confirm').value = ''; state.password = password; state.pendingWallet = wallet; state.token = wallet.token; state.username = wallet.username; sessionStorage.setItem('orbit-session', wallet.token); openPhrase(wallet.recoveryPhrase) }
   catch (error) { setFormError('register-error', error.message) }
   finally { button.disabled = false; button.innerHTML = 'Create secure wallet <span>↗</span>' }
 })
 ;['register-username', 'register-password', 'register-password-confirm'].forEach(id => $(`#${id}`).addEventListener('input', () => setFormError('register-error', '')))
 $('#login-form').addEventListener('submit', async event => {
   event.preventDefault(); setFormError('login-error', ''); const button = $('#login-submit'); button.disabled = true; button.textContent = 'Unlocking wallet…'
-  try { const wallet = await api('login', { username: $('#login-username').value.trim(), password: $('#login-password').value }); $('#login-dialog').close(); $('#login-password').value = ''; setWallet(wallet) }
+  try { const password = $('#login-password').value; const wallet = await api('login', { username: $('#login-username').value.trim(), password }); $('#login-dialog').close(); $('#login-password').value = ''; setWallet(wallet, password) }
   catch (error) { setFormError('login-error', error.message) }
   finally { button.disabled = false; button.innerHTML = 'Log in securely <span>↗</span>' }
 })
@@ -220,13 +222,14 @@ $('#restore-submit').addEventListener('click', async event => {
   if (restoreWords.slice(0, restoreWordCount).some(word => !word.trim())) return setFormError('restore-error', `Enter all ${restoreWordCount} recovery words in order.`)
   const button = $('#restore-submit'); button.disabled = true; button.textContent = 'Restoring wallet…'
   try {
-    const wallet = await api('restore', { phrase, username: $('#restore-username').value.trim(), password: $('#restore-password').value })
-    $('#restore-dialog').close(); restoreWords = Array(24).fill(''); $('#restore-password').value = ''; setWallet(wallet); toast('Wallet restored securely')
+    const password = $('#restore-password').value
+    const wallet = await api('restore', { phrase, username: $('#restore-username').value.trim(), password })
+    $('#restore-dialog').close(); restoreWords = Array(24).fill(''); $('#restore-password').value = ''; setWallet(wallet, password); toast('Wallet restored securely')
   } catch (error) { setFormError('restore-error', error.message) }
   finally { button.disabled = false; button.innerHTML = 'Restore wallet <span>↗</span>' }
 })
 ;['restore-username', 'restore-password'].forEach(id => $(`#${id}`).addEventListener('input', () => setFormError('restore-error', '')))
-$('#lock-wallet').addEventListener('click', async () => { try { await api('lock', {}) } catch {} setPublicAddressesOpen(false); sessionStorage.removeItem('orbit-session'); state.token = null; state.addresses = {}; state.balances = {}; state.username = ''; $('#wallet-shell').classList.add('hidden'); $('#welcome').classList.remove('hidden') })
+$('#lock-wallet').addEventListener('click', async () => { try { await api('lock', {}) } catch {} setPublicAddressesOpen(false); sessionStorage.removeItem('orbit-session'); state.token = null; state.password = ''; state.addresses = {}; state.balances = {}; state.username = ''; $('#wallet-shell').classList.add('hidden'); $('#welcome').classList.remove('hidden') })
 $('#refresh').addEventListener('click', refreshBalances)
 $('#toggle-balance').addEventListener('click', () => { state.hidden = !state.hidden; renderTotal() })
 $('#about-security').addEventListener('click', () => { $('#reveal-password').value = ''; $('#recovery-reveal').classList.add('hidden'); $('#recovery-words').replaceChildren(); $('#security-dialog').showModal() })
@@ -431,4 +434,4 @@ $$('dialog form').forEach(form => form.addEventListener('submit', event => {
   if (submit && !submit.disabled) submit.click()
 }))
 
-api('state').then(result => { if (result.authenticated) setWallet(result); else { state.token = null; sessionStorage.removeItem('orbit-session') } }).catch(() => {})
+api('state').then(result => { if (result.authenticated) setWallet(result); else { state.token = null; sessionStorage.removeItem('orbit-session') } }).catch(() => { state.token = null; sessionStorage.removeItem('orbit-session') })
